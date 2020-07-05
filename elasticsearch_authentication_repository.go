@@ -2,13 +2,18 @@ package elasticsearch
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
+	"reflect"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/elastic/go-elasticsearch"
+	"github.com/elastic/go-elasticsearch/esapi"
+	"github.com/elastic/go-elasticsearch/esutil"
 
 	"github.com/common-go/auth"
-	db "github.com/common-go/elasticsearch"
 )
 
 type ElasticSearchAuthenticationRepository struct {
@@ -58,7 +63,7 @@ func (r *ElasticSearchAuthenticationRepository) GetUserInfo(ctx context.Context,
 		},
 	}
 	raw := make(map[string]interface{})
-	ok, err := db.FindOneAndDecode(ctx, r.Db, []string{r.UserIndexName}, query, &raw)
+	ok, err := findOneAndDecode(ctx, r.Db, []string{r.UserIndexName}, query, &raw)
 	if !ok || err != nil {
 		return nil, err
 	}
@@ -155,7 +160,7 @@ func (r *ElasticSearchAuthenticationRepository) GetUserInfo(ctx context.Context,
 	}
 
 	rawPassword := make(map[string]interface{})
-	ok1, er1 := db.FindOneAndDecode(ctx, r.Db, []string{r.UserIndexName}, query, &rawPassword)
+	ok1, er1 := findOneAndDecode(ctx, r.Db, []string{r.UserIndexName}, query, &rawPassword)
 	if !ok1 || er1 != nil {
 		return nil, er1
 	}
@@ -241,20 +246,20 @@ func (r *ElasticSearchAuthenticationRepository) passAuthenticationAndActivate(ct
 		pass[r.LockedUntilTimeName] = nil
 	}
 	if !updateStatus {
-		return db.UpsertOne(ctx, r.Db, r.PasswordIndexName, userId, pass)
+		return upsertOne(ctx, r.Db, r.PasswordIndexName, userId, pass)
 	}
 	if r.UserIndexName == r.PasswordIndexName {
 		pass[r.StatusName] = r.ActivatedStatus
-		return db.UpsertOne(ctx, r.Db, r.PasswordIndexName, userId, pass)
+		return upsertOne(ctx, r.Db, r.PasswordIndexName, userId, pass)
 	}
-	k1, er1 := db.UpsertOne(ctx, r.Db, r.PasswordIndexName, userId, pass)
+	k1, er1 := upsertOne(ctx, r.Db, r.PasswordIndexName, userId, pass)
 	if er1 != nil {
 		return k1, er1
 	}
 	user := make(map[string]interface{})
 	user["_id"] = userId
 	user[r.StatusName] = r.ActivatedStatus
-	k2, er2 := db.UpsertOne(ctx, r.Db, r.UserIndexName, userId, user)
+	k2, er2 := upsertOne(ctx, r.Db, r.UserIndexName, userId, user)
 	return k1 + k2, er2
 }
 
@@ -273,6 +278,104 @@ func (r *ElasticSearchAuthenticationRepository) WrongPassword(ctx context.Contex
 			pass[r.LockedUntilTimeName] = lockedUntil
 		}
 	}
-	_, err := db.UpsertOne(ctx, r.Db, r.PasswordIndexName, userId, pass)
+	_, err := upsertOne(ctx, r.Db, r.PasswordIndexName, userId, pass)
 	return err
+}
+
+func findOneAndDecode(ctx context.Context, es *elasticsearch.Client, index []string, query map[string]interface{}, result interface{}) (bool, error) {
+	req := esapi.SearchRequest{
+		Index:          index,
+		Body:           esutil.NewJSONReader(query),
+		TrackTotalHits: true,
+		Pretty:         true,
+	}
+	res, err := req.Do(ctx, es)
+	if err != nil {
+		return false, err
+	}
+	defer res.Body.Close()
+
+	if res.IsError() {
+		return false, errors.New("response error")
+	} else {
+		var r map[string]interface{}
+		if err := json.NewDecoder(res.Body).Decode(&r); err != nil {
+			return false, err
+		} else {
+			hits := r["hits"].(map[string]interface{})["hits"].([]interface{})
+			total := int(r["hits"].(map[string]interface{})["total"].(map[string]interface{})["value"].(float64))
+			if total >= 1 {
+				if err := json.NewDecoder(esutil.NewJSONReader(hits[0])).Decode(&result); err != nil {
+					return false, err
+				}
+				return true, nil
+			}
+			return false, nil
+		}
+	}
+}
+
+func upsertOne(ctx context.Context, es *elasticsearch.Client, indexName string, id string, model interface{}) (int64, error) {
+	body := buildQueryWithoutIdFromObject(model)
+	req := esapi.UpdateRequest{
+		Index:      indexName,
+		DocumentID: id,
+		Body:       esutil.NewJSONReader(body),
+		Refresh:    "true",
+	}
+	res, err := req.Do(ctx, es)
+	if err != nil {
+		return -1, err
+	}
+	defer res.Body.Close()
+	if res.IsError() {
+		return -1, errors.New("document ID not exists in the index")
+	}
+	var r map[string]interface{}
+	if err := json.NewDecoder(res.Body).Decode(&r); err != nil {
+		return -1, err
+	}
+	successful := int64(r["_shards"].(map[string]interface{})["successful"].(float64))
+	return successful, nil
+}
+
+func buildQueryWithoutIdFromObject(object interface{}) map[string]interface{} {
+	valueOf := reflect.Indirect(reflect.ValueOf(object))
+	idIndex, _ := findIdField(valueOf.Type())
+	result := map[string]interface{}{}
+	for i := 0; i < valueOf.NumField(); i++ {
+		if i != idIndex {
+			_, jsonName := findFieldByIndex(valueOf.Type(), i)
+			result[jsonName] = valueOf.Field(i).Interface()
+		}
+	}
+	return result
+}
+
+func findIdField(modelType reflect.Type) (int, string) {
+	return findFieldByJson(modelType, "_id")
+}
+
+func findFieldByJson(modelType reflect.Type, jsonTagName string) (index int, fieldName string) {
+	numField := modelType.NumField()
+	for i := 0; i < numField; i++ {
+		field := modelType.Field(i)
+		tag1, ok1 := field.Tag.Lookup("json")
+		if ok1 && strings.Split(tag1, ",")[0] == jsonTagName {
+			return i, field.Name
+		}
+	}
+	return -1, jsonTagName
+}
+
+func findFieldByIndex(modelType reflect.Type, fieldIndex int) (fieldName, jsonTagName string) {
+	if fieldIndex < modelType.NumField() {
+		field := modelType.Field(fieldIndex)
+		jsonTagName := ""
+		if jsonTag, ok := field.Tag.Lookup("json"); ok {
+			jsonTagName = strings.Split(jsonTag, ",")[0]
+		}
+		return field.Name, jsonTagName
+	}
+	return "", ""
 }
