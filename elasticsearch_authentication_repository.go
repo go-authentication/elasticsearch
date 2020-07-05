@@ -1,0 +1,278 @@
+package elasticsearch
+
+import (
+	"context"
+	"strconv"
+	"time"
+
+	"github.com/elastic/go-elasticsearch"
+
+	"github.com/common-go/auth"
+	db "github.com/common-go/elasticsearch"
+)
+
+type ElasticSearchAuthenticationRepository struct {
+	Db                      *elasticsearch.Client
+	UserIndexName           string
+	PasswordIndexName       string
+	TwoFactorRepository     auth.TwoFactorAuthenticationRepository
+	ActivatedStatus         interface{}
+	Status                  auth.StatusConfig
+	UserName                string
+	SuccessTimeName         string
+	FailTimeName            string
+	FailCountName           string
+	LockedUntilTimeName     string
+	StatusName              string
+	PasswordChangedTimeName string
+	PasswordName            string
+	ContactName             string
+	DisplayNameName         string
+	MaxPasswordAgeName      string
+	RolesName               string
+	UserTypeName            string
+	AccessDateFromName      string
+	AccessDateToName        string
+	AccessTimeFromName      string
+	AccessTimeToName        string
+	TwoFactorsName          string
+}
+
+func NewElasticSearchAuthenticationRepositoryByConfig(db *elasticsearch.Client, userIndexName, passwordIndexName string, twoFactorRepository auth.TwoFactorAuthenticationRepository, activatedStatus interface{}, status auth.StatusConfig, c auth.SchemaConfig) *ElasticSearchAuthenticationRepository {
+	return NewElasticSearchAuthenticationRepository(db, userIndexName, passwordIndexName, twoFactorRepository, activatedStatus, status, c.UserName, c.SuccessTime, c.FailTime, c.FailCount, c.LockedUntilTime, c.Status, c.PasswordChangedTime, c.Password, c.Contact, c.DisplayName, c.MaxPasswordAge, c.Roles, c.UserType, c.AccessDateFrom, c.AccessDateTo, c.AccessTimeFrom, c.AccessTimeTo, c.TwoFactors)
+}
+
+func NewElasticSearchAuthenticationRepository(db *elasticsearch.Client, userIndexName, passwordIndexName string, twoFactorRepository auth.TwoFactorAuthenticationRepository, activatedStatus interface{}, status auth.StatusConfig, userName, successTimeName, failTimeName, failCountName, lockedUntilTimeName, statusName, passwordChangedTimeName, passwordName, emailName, displayNameName, maxPasswordAgeName, rolesName, userTypeName, accessDateFromName, accessDateToName, accessTimeFromName, accessTimeToName string, twoFactorsName string) *ElasticSearchAuthenticationRepository {
+	return &ElasticSearchAuthenticationRepository{db, userIndexName, passwordIndexName, twoFactorRepository, activatedStatus, status, userName, successTimeName, failTimeName, failCountName, lockedUntilTimeName, statusName, passwordChangedTimeName, passwordName, emailName, displayNameName, maxPasswordAgeName, rolesName, userTypeName, accessDateFromName, accessDateToName, accessTimeFromName, accessTimeToName, twoFactorsName}
+}
+
+func (r *ElasticSearchAuthenticationRepository) GetUserInfo(ctx context.Context, username string) (*auth.UserInfo, error) {
+	userInfo := auth.UserInfo{}
+	query := map[string]interface{}{
+		"query": map[string]interface{}{
+			"bool": map[string]interface{}{
+				"match": map[string]interface{}{
+					"_id": username,
+				},
+			},
+		},
+	}
+	raw := make(map[string]interface{})
+	ok, err := db.FindOneAndDecode(ctx, r.Db, []string{r.UserIndexName}, query, &raw)
+	if !ok || err != nil {
+		return nil, err
+	}
+
+	if len(r.StatusName) > 0 {
+		rawStatus := raw[r.StatusName]
+		status, ok := rawStatus.(string)
+		if !ok {
+			iStatus, ok2 := rawStatus.(int32)
+			if ok2 {
+				status = strconv.Itoa(int(iStatus))
+			} else {
+				bStatus, ok3 := rawStatus.(bool)
+				if ok3 {
+					status = strconv.FormatBool(bStatus)
+				}
+			}
+		}
+		userInfo.Deactivated = status == r.Status.Deactivated
+		userInfo.Suspended = status == r.Status.Suspended
+		userInfo.Disable = status == r.Status.Disable
+	}
+
+	if len(r.ContactName) > 0 {
+		if email, ok := raw[r.ContactName].(string); ok {
+			userInfo.Contact = email
+		}
+	}
+
+	if len(r.DisplayNameName) > 0 {
+		if displayName, ok := raw[r.DisplayNameName].(string); ok {
+			userInfo.DisplayName = displayName
+		}
+	}
+
+	if len(r.MaxPasswordAgeName) > 0 {
+		if maxPasswordAgeName, ok := raw[r.MaxPasswordAgeName].(int32); ok {
+			userInfo.MaxPasswordAge = int(maxPasswordAgeName)
+		}
+	}
+
+	if len(r.UserTypeName) > 0 {
+		if userType, ok := raw[r.UserTypeName].(string); ok {
+			userInfo.UserType = userType
+		}
+	}
+
+	if len(r.AccessDateFromName) > 0 {
+		if accessDateFrom, ok := raw[r.AccessDateFromName].(time.Time); ok {
+			userInfo.AccessDateFrom = &accessDateFrom
+		}
+	}
+
+	if len(r.AccessDateToName) > 0 {
+		if accessDateTo, ok := raw[r.AccessDateToName].(time.Time); ok {
+			userInfo.AccessDateTo = &accessDateTo
+		}
+	}
+
+	if len(r.AccessTimeFromName) > 0 {
+		if accessTimeFrom, ok := raw[r.AccessTimeFromName].(time.Time); ok {
+			userInfo.AccessTimeFrom = &accessTimeFrom
+		} else if accessTimeFrom, ok := raw[r.AccessTimeFromName].(string); ok {
+			userInfo.AccessTimeFrom = getTime(accessTimeFrom)
+		}
+	}
+
+	if len(r.AccessTimeToName) > 0 {
+		if accessTimeTo, ok := raw[r.AccessTimeToName].(time.Time); ok {
+			userInfo.AccessTimeTo = &accessTimeTo
+		} else if accessTimeTo, ok := raw[r.AccessTimeToName].(string); ok {
+			userInfo.AccessTimeTo = getTime(accessTimeTo)
+		}
+	}
+
+	if r.TwoFactorRepository != nil {
+		id := userInfo.UserId
+		if len(id) == 0 {
+			id = username
+		}
+		ok, er2 := r.TwoFactorRepository.Require(ctx, id)
+		if er2 != nil {
+			return &userInfo, er2
+		}
+		userInfo.TwoFactors = ok
+	} else if len(r.TwoFactorsName) > 0 {
+		if isTwoFactor, ok := raw[r.AccessTimeToName].(bool); ok {
+			userInfo.TwoFactors = isTwoFactor
+		}
+	}
+
+	if r.UserIndexName == r.PasswordIndexName {
+		return r.getPasswordInfo(ctx, &userInfo, raw), nil
+	}
+
+	rawPassword := make(map[string]interface{})
+	ok1, er1 := db.FindOneAndDecode(ctx, r.Db, []string{r.UserIndexName}, query, &rawPassword)
+	if !ok1 || er1 != nil {
+		return nil, er1
+	}
+	return r.getPasswordInfo(ctx, &userInfo, rawPassword), nil
+}
+
+func getTime(accessTime string) *time.Time {
+	const LAYOUT = "2006-01-02T15:04"
+	if len(accessTime) > 0 {
+		today := time.Now()
+		location := time.Now().Location()
+		x := today.Format("2006-01-02") + "T" + accessTime
+		t, e := time.ParseInLocation(LAYOUT, x, location)
+		if e == nil {
+			return &t
+		}
+	}
+	return nil
+}
+
+func (r *ElasticSearchAuthenticationRepository) getPasswordInfo(ctx context.Context, user *auth.UserInfo, raw map[string]interface{}) *auth.UserInfo {
+	if len(r.PasswordName) > 0 {
+		if pass, ok := raw[r.PasswordName].(string); ok {
+			user.Password = pass
+		}
+	}
+
+	if len(r.LockedUntilTimeName) > 0 {
+		if lockedUntilTime, ok := raw[r.LockedUntilTimeName].(time.Time); ok {
+			user.LockedUntilTime = &lockedUntilTime
+		}
+	}
+
+	if len(r.SuccessTimeName) > 0 {
+		if successTime, ok := raw[r.SuccessTimeName].(time.Time); ok {
+			user.SuccessTime = &successTime
+		}
+	}
+
+	if len(r.FailTimeName) > 0 {
+		if failTime, ok := raw[r.FailTimeName].(time.Time); ok {
+			user.FailTime = &failTime
+		}
+	}
+
+	if len(r.FailCountName) > 0 {
+		if failCountName, ok := raw[r.FailCountName].(int32); ok {
+			user.FailCount = int(failCountName)
+		}
+	}
+
+	if len(r.PasswordChangedTimeName) > 0 {
+		if passwordChangedTime, ok := raw[r.PasswordChangedTimeName].(time.Time); ok {
+			user.PasswordChangedTime = &passwordChangedTime
+		}
+	}
+	return user
+}
+
+func (r *ElasticSearchAuthenticationRepository) PassAuthentication(ctx context.Context, userId string) (int64, error) {
+	return r.passAuthenticationAndActivate(ctx, userId, false)
+}
+
+func (r *ElasticSearchAuthenticationRepository) PassAuthenticationAndActivate(ctx context.Context, userId string) (int64, error) {
+	return r.passAuthenticationAndActivate(ctx, userId, true)
+}
+
+func (r *ElasticSearchAuthenticationRepository) passAuthenticationAndActivate(ctx context.Context, userId string, updateStatus bool) (int64, error) {
+	if len(r.SuccessTimeName) == 0 && len(r.FailCountName) == 0 && len(r.LockedUntilTimeName) == 0 {
+		if !updateStatus || len(r.StatusName) == 0 {
+			return 0, nil
+		}
+	}
+	pass := make(map[string]interface{})
+	pass["_id"] = userId
+	if len(r.SuccessTimeName) > 0 {
+		pass[r.SuccessTimeName] = time.Now()
+	}
+	if len(r.FailCountName) > 0 {
+		pass[r.FailCountName] = 0
+	}
+	if len(r.LockedUntilTimeName) > 0 {
+		pass[r.LockedUntilTimeName] = nil
+	}
+	if !updateStatus {
+		return db.UpsertOne(ctx, r.Db, r.PasswordIndexName, userId, pass)
+	}
+	if r.UserIndexName == r.PasswordIndexName {
+		pass[r.StatusName] = r.ActivatedStatus
+		return db.UpsertOne(ctx, r.Db, r.PasswordIndexName, userId, pass)
+	}
+	k1, er1 := db.UpsertOne(ctx, r.Db, r.PasswordIndexName, userId, pass)
+	if er1 != nil {
+		return k1, er1
+	}
+	user := make(map[string]interface{})
+	user["_id"] = userId
+	user[r.StatusName] = r.ActivatedStatus
+	k2, er2 := db.UpsertOne(ctx, r.Db, r.UserIndexName, userId, user)
+	return k1 + k2, er2
+}
+
+func (r *ElasticSearchAuthenticationRepository) WrongPassword(ctx context.Context, userId string, failCount int, lockedUntil *time.Time) error {
+	if len(r.FailTimeName) == 0 && len(r.FailCountName) == 0 && len(r.LockedUntilTimeName) == 0 {
+		return nil
+	}
+	pass := make(map[string]interface{})
+	pass["_id"] = userId
+	if len(r.FailTimeName) > 0 {
+		pass[r.FailTimeName] = time.Now()
+	}
+	if len(r.FailCountName) > 0 {
+		pass[r.FailCountName] = failCount
+		if len(r.LockedUntilTimeName) > 0 {
+			pass[r.LockedUntilTimeName] = lockedUntil
+		}
+	}
+	_, err := db.UpsertOne(ctx, r.Db, r.PasswordIndexName, userId, pass)
+	return err
+}
